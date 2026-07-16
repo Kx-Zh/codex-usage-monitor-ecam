@@ -1,0 +1,14 @@
+/dist/
+/release/
+/.vs/
+*.pdb
+*.suo
+*.user
+*.zip
+*.sha256
+codex.exe
+codex.cmd
+codex.bat
+auth.json
+.credentials.json
+*.jsonl
