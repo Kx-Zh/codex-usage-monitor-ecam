@@ -1,4 +1,4 @@
-# Codex ECAM Monitor
+# Codex Usage Monitor — ECAM
 
 [简体中文](README.zh-CN.md)
 

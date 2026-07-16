@@ -1,4 +1,4 @@
-# Codex ECAM Monitor v1.0.0
+# Codex Usage Monitor — ECAM v1.0.0
 
 Initial public release of the Windows-native Codex ECAM Monitor.
 
