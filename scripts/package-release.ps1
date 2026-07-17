@@ -1,5 +1,5 @@
 param(
-    [string] $Version = "1.0.0"
+    [string] $Version = "1.0.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,8 +11,10 @@ $archiveName = "CodexEcamMonitor-v$Version-win-x64.zip"
 $archive = Join-Path $release $archiveName
 $checksum = "$archive.sha256"
 
-& (Join-Path $PSScriptRoot "build.cmd")
-if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE." }
+$buildScript = Join-Path $PSScriptRoot "build.cmd"
+$commandProcessor = Join-Path $env:SystemRoot "System32\cmd.exe"
+$buildProcess = Start-Process -FilePath $commandProcessor -ArgumentList @("/d", "/c", "`"$buildScript`"") -Wait -PassThru -NoNewWindow
+if ($buildProcess.ExitCode -ne 0) { throw "Build failed with exit code $($buildProcess.ExitCode)." }
 
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path (Join-Path $stage "assets") -Force | Out-Null

@@ -45,55 +45,234 @@ namespace CodexEcamMonitor
         public DateTime UpdatedAt;
     }
 
+    internal sealed class ContextUsage
+    {
+        public long Tokens;
+        public long Window;
+        public string ConversationId = "";
+        public string SessionPath = "";
+    }
+
+    internal static class CodexPathResolver
+    {
+        public static string ResolveHome()
+        {
+            string configured = Environment.GetEnvironmentVariable("CODEX_HOME");
+            if (!String.IsNullOrWhiteSpace(configured))
+                return Path.GetFullPath(Normalize(configured));
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".codex");
+        }
+
+        private static string Normalize(string value)
+        {
+            string result = Environment.ExpandEnvironmentVariables(value.Trim());
+            if (result.Length >= 2 && result[0] == '"' && result[result.Length - 1] == '"')
+                result = result.Substring(1, result.Length - 2);
+            return result;
+        }
+    }
+
     // Token data is not part of account/rateLimits/read. Codex records it in
-    // the local rollout JSONL, so this gauge intentionally represents only
-    // the most recently active local task's current context load.
+    // the focused task's rollout JSONL, identified through Codex Desktop logs.
     internal static class LocalTokenReader
     {
-        public static void Populate(UsageSnapshot snapshot)
+        private const int MaximumTailBytes = 4 * 1024 * 1024;
+
+        public static bool TryRead(out ContextUsage usage)
+        {
+            return TryReadFromRoots(
+                CodexPathResolver.ResolveHome(),
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                out usage);
+        }
+
+        internal static bool TryReadFromRoots(string codexHome, string localAppData, out ContextUsage usage)
+        {
+            usage = null;
+            try
+            {
+                List<string> sessions = EnumerateSessions(codexHome);
+                if (sessions.Count == 0) return false;
+
+                string conversationId = FindFocusedConversationId(localAppData);
+                string target = FindSession(sessions, conversationId);
+                bool focusedSessionFound = target != null;
+                if (target == null)
+                    target = sessions
+                        .Where(delegate(string path) { return !IsSubagentSession(path); })
+                        .OrderByDescending(delegate(string path) { return SafeLastWriteTimeUtc(path); })
+                        .FirstOrDefault();
+                if (target == null) return false;
+
+                ContextUsage result;
+                if (!TryReadTokenCount(target, out result)) return false;
+                result.ConversationId = focusedSessionFound
+                    ? conversationId
+                    : ConversationIdFromFileName(target);
+                result.SessionPath = target;
+                usage = result;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static List<string> EnumerateSessions(string codexHome)
+        {
+            List<string> sessions = new List<string>();
+            AddFiles(sessions, Path.Combine(codexHome, "sessions"), "*.jsonl");
+            AddFiles(sessions, Path.Combine(codexHome, "archived_sessions"), "*.jsonl");
+            return sessions;
+        }
+
+        private static void AddFiles(List<string> destination, string root, string pattern)
         {
             try
             {
-                string sessionsRoot = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    ".codex",
-                    "sessions");
-                if (!Directory.Exists(sessionsRoot)) return;
+                if (Directory.Exists(root))
+                    destination.AddRange(Directory.GetFiles(root, pattern, SearchOption.AllDirectories));
+            }
+            catch { }
+        }
 
-                List<string> candidates = new List<string>();
-                for (int offset = 0; offset <= 1; offset++)
+        private static string FindFocusedConversationId(string localAppData)
+        {
+            List<string> logs = new List<string>();
+            AddFiles(logs, Path.Combine(localAppData, "Codex", "Logs"), "*.log");
+            AddFiles(logs, Path.Combine(localAppData, "OpenAI", "Codex", "Logs"), "*.log");
+
+            string packages = Path.Combine(localAppData, "Packages");
+            try
+            {
+                if (Directory.Exists(packages))
                 {
-                    DateTime day = DateTime.Today.AddDays(-offset);
-                    string dayRoot = Path.Combine(
-                        sessionsRoot,
-                        day.ToString("yyyy", CultureInfo.InvariantCulture),
-                        day.ToString("MM", CultureInfo.InvariantCulture),
-                        day.ToString("dd", CultureInfo.InvariantCulture));
-                    if (Directory.Exists(dayRoot))
-                        candidates.AddRange(Directory.GetFiles(dayRoot, "*.jsonl"));
-                }
-
-                string latest = candidates
-                    .OrderByDescending(delegate(string path) { return File.GetLastWriteTimeUtc(path); })
-                    .FirstOrDefault();
-                if (latest == null) return;
-
-                string[] lines = ReadTail(latest, 4 * 1024 * 1024)
-                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                JavaScriptSerializer json = new JavaScriptSerializer();
-                for (int index = lines.Length - 1; index >= 0; index--)
-                {
-                    if (lines[index].IndexOf("\"type\":\"token_count\"", StringComparison.Ordinal) < 0) continue;
-                    Dictionary<string, object> record = json.Deserialize<Dictionary<string, object>>(lines[index]);
-                    Dictionary<string, object> payload = Dictionary(record, "payload");
-                    Dictionary<string, object> info = Dictionary(payload, "info");
-                    Dictionary<string, object> usage = Dictionary(info, "last_token_usage");
-                    snapshot.ContextTokens = Convert.ToInt64(Number(usage, "total_tokens"));
-                    snapshot.ContextWindow = Convert.ToInt64(Number(info, "model_context_window"));
-                    return;
+                    foreach (string package in Directory.GetDirectories(packages, "OpenAI.Codex_*"))
+                        AddFiles(logs, Path.Combine(package, "LocalCache", "Local", "Codex", "Logs"), "*.log");
                 }
             }
             catch { }
+
+            string bestConversationId = null;
+            DateTime bestEventUtc = DateTime.MinValue;
+            foreach (string log in logs.OrderByDescending(delegate(string path) { return SafeLastWriteTimeUtc(path); }))
+            {
+                DateTime logWriteUtc = SafeLastWriteTimeUtc(log);
+                if (bestEventUtc != DateTime.MinValue && logWriteUtc < bestEventUtc) break;
+                string[] lines;
+                try
+                {
+                    lines = ReadTail(log, MaximumTailBytes)
+                        .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                }
+                catch { continue; }
+
+                for (int index = lines.Length - 1; index >= 0; index--)
+                {
+                    string line = lines[index];
+                    if (line.IndexOf("thread_stream_view_activity_changed", StringComparison.Ordinal) < 0 ||
+                        line.IndexOf("active=true", StringComparison.Ordinal) < 0)
+                        continue;
+                    string id = FieldValue(line, "conversationId=");
+                    Guid parsed;
+                    if (!Guid.TryParse(id, out parsed)) continue;
+                    DateTime eventUtc = ParseLogTimestampUtc(line, logWriteUtc);
+                    if (eventUtc > bestEventUtc)
+                    {
+                        bestEventUtc = eventUtc;
+                        bestConversationId = id;
+                    }
+                    break;
+                }
+            }
+            return bestConversationId;
+        }
+
+        private static DateTime ParseLogTimestampUtc(string line, DateTime fallback)
+        {
+            int separator = line.IndexOf(' ');
+            if (separator <= 0) return fallback;
+            DateTime parsed;
+            if (DateTime.TryParse(
+                line.Substring(0, separator),
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out parsed))
+                return parsed;
+            return fallback;
+        }
+
+        private static string FieldValue(string line, string marker)
+        {
+            int start = line.IndexOf(marker, StringComparison.Ordinal);
+            if (start < 0) return null;
+            start += marker.Length;
+            int end = start;
+            while (end < line.Length && !Char.IsWhiteSpace(line[end])) end++;
+            return line.Substring(start, end - start).Trim('"');
+        }
+
+        private static string FindSession(List<string> sessions, string conversationId)
+        {
+            if (String.IsNullOrWhiteSpace(conversationId)) return null;
+            string target = sessions
+                .Where(delegate(string path)
+                {
+                    return Path.GetFileName(path).IndexOf(conversationId, StringComparison.OrdinalIgnoreCase) >= 0;
+                })
+                .OrderByDescending(delegate(string path) { return SafeLastWriteTimeUtc(path); })
+                .FirstOrDefault();
+            if (target != null) return target;
+
+            foreach (string path in sessions)
+            {
+                try
+                {
+                    if (ReadHead(path, 256 * 1024).IndexOf(conversationId, StringComparison.OrdinalIgnoreCase) >= 0)
+                        return path;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        private static bool IsSubagentSession(string path)
+        {
+            try
+            {
+                string metadata = ReadHead(path, 256 * 1024);
+                return metadata.IndexOf("\"thread_source\":\"subagent\"", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    metadata.IndexOf("\"source\":{\"subagent\"", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch { return true; }
+        }
+
+        private static bool TryReadTokenCount(string path, out ContextUsage usage)
+        {
+            usage = null;
+            string[] lines = ReadTail(path, MaximumTailBytes)
+                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            JavaScriptSerializer json = new JavaScriptSerializer();
+            for (int index = lines.Length - 1; index >= 0; index--)
+            {
+                if (lines[index].IndexOf("\"type\":\"token_count\"", StringComparison.Ordinal) < 0) continue;
+                try
+                {
+                    Dictionary<string, object> record = json.Deserialize<Dictionary<string, object>>(lines[index]);
+                    Dictionary<string, object> payload = Dictionary(record, "payload");
+                    Dictionary<string, object> info = Dictionary(payload, "info");
+                    Dictionary<string, object> lastUsage = Dictionary(info, "last_token_usage");
+                    long tokens = Convert.ToInt64(Number(lastUsage, "total_tokens"));
+                    long window = Convert.ToInt64(Number(info, "model_context_window"));
+                    if (tokens < 0 || window <= 0) continue;
+                    usage = new ContextUsage();
+                    usage.Tokens = tokens;
+                    usage.Window = window;
+                    return true;
+                }
+                catch { }
+            }
+            return false;
         }
 
         private static string ReadTail(string path, int maximumBytes)
@@ -116,6 +295,43 @@ namespace CodexEcamMonitor
                 }
                 return Encoding.UTF8.GetString(buffer, 0, read);
             }
+        }
+
+        private static string ReadHead(string path, int maximumBytes)
+        {
+            using (FileStream stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete))
+            {
+                int count = (int)Math.Min((long)maximumBytes, stream.Length);
+                byte[] buffer = new byte[count];
+                int read = 0;
+                while (read < count)
+                {
+                    int amount = stream.Read(buffer, read, count - read);
+                    if (amount == 0) break;
+                    read += amount;
+                }
+                return Encoding.UTF8.GetString(buffer, 0, read);
+            }
+        }
+
+        private static DateTime SafeLastWriteTimeUtc(string path)
+        {
+            try { return File.GetLastWriteTimeUtc(path); }
+            catch { return DateTime.MinValue; }
+        }
+
+        private static string ConversationIdFromFileName(string path)
+        {
+            string name = Path.GetFileNameWithoutExtension(path);
+            int separator = name.LastIndexOf('-');
+            if (separator < 0) return "";
+            string possible = name.Substring(Math.Max(0, name.Length - 36));
+            Guid parsed;
+            return Guid.TryParse(possible, out parsed) ? possible : "";
         }
 
         private static Dictionary<string, object> Dictionary(Dictionary<string, object> source, string key)
@@ -193,7 +409,6 @@ namespace CodexEcamMonitor
                 Dictionary<string, object> resetCredits = AsDictionaryOrNull(Get(result, "rateLimitResetCredits"));
                 if (resetCredits != null && Get(resetCredits, "availableCount") != null)
                     snapshot.ResetCredits = Convert.ToInt32(Number(Get(resetCredits, "availableCount")));
-                LocalTokenReader.Populate(snapshot);
                 snapshot.UpdatedAt = DateTime.Now;
                 return snapshot;
             }
@@ -234,7 +449,7 @@ namespace CodexEcamMonitor
             Dictionary<string, object> clientInfo = new Dictionary<string, object>();
             clientInfo["name"] = "codex_ecam_monitor_native";
             clientInfo["title"] = "Codex ECAM Monitor";
-            clientInfo["version"] = "1.0.0";
+            clientInfo["version"] = "1.0.1";
             Dictionary<string, object> initialize = new Dictionary<string, object>();
             initialize["clientInfo"] = clientInfo;
             Call("initialize", initialize, timeoutMilliseconds);
@@ -326,7 +541,7 @@ namespace CodexEcamMonitor
         private void PrepareIsolatedHome()
         {
             Directory.CreateDirectory(isolatedHome);
-            string sourceHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+            string sourceHome = CodexPathResolver.ResolveHome();
             CopyCredentialIfPresent(sourceHome, "auth.json");
             CopyCredentialIfPresent(sourceHome, ".credentials.json");
         }
@@ -461,6 +676,7 @@ namespace CodexEcamMonitor
         private readonly string positionFile;
         private readonly AppServerClient client;
         private readonly System.Windows.Forms.Timer refreshTimer;
+        private readonly System.Windows.Forms.Timer contextRefreshTimer;
         private readonly PrivateFontCollection privateFonts = new PrivateFontCollection();
         private FontFamily ecamFamily;
         private Font titleFont;
@@ -480,6 +696,7 @@ namespace CodexEcamMonitor
         private bool isLive;
         private string lastError = "";
         private int queryRunning;
+        private int contextQueryRunning;
         private bool dragging;
         private Point dragOffset;
 
@@ -521,12 +738,17 @@ namespace CodexEcamMonitor
             MouseUp += delegate { dragging = false; };
             KeyDown += OnKeyDown;
             FormClosing += OnClosing;
-            Shown += delegate { QueueRefresh(); };
+            Shown += delegate { QueueAllRefreshes(); };
 
             refreshTimer = new System.Windows.Forms.Timer();
             refreshTimer.Interval = 60000;
             refreshTimer.Tick += delegate { QueueRefresh(); };
             refreshTimer.Start();
+
+            contextRefreshTimer = new System.Windows.Forms.Timer();
+            contextRefreshTimer.Interval = 5000;
+            contextRefreshTimer.Tick += delegate { QueueContextRefresh(); };
+            contextRefreshTimer.Start();
         }
 
         private void LoadFonts()
@@ -557,7 +779,7 @@ namespace CodexEcamMonitor
             menu.Items.Add(windowTopItem);
             menu.Items.Add(new ToolStripSeparator());
             ToolStripItem exit = menu.Items.Add("Exit");
-            refresh.Click += delegate { QueueRefresh(); };
+            refresh.Click += delegate { QueueAllRefreshes(); };
             hide.Click += delegate { HideMonitor(); };
             windowTopItem.CheckedChanged += delegate
             {
@@ -586,7 +808,7 @@ namespace CodexEcamMonitor
 
             trayShowItem.Click += delegate { ShowMonitor(); };
             trayHideItem.Click += delegate { HideMonitor(); };
-            refresh.Click += delegate { QueueRefresh(); };
+            refresh.Click += delegate { QueueAllRefreshes(); };
             trayTopItem.CheckedChanged += delegate
             {
                 TopMost = trayTopItem.Checked;
@@ -697,6 +919,8 @@ namespace CodexEcamMonitor
                     UsageSnapshot fresh = client.QueryUsage(30000);
                     BeginInvoke((MethodInvoker)delegate
                     {
+                        fresh.ContextTokens = snapshot.ContextTokens;
+                        fresh.ContextWindow = snapshot.ContextWindow;
                         snapshot = fresh;
                         isLive = true;
                         lastError = "";
@@ -707,19 +931,48 @@ namespace CodexEcamMonitor
                 }
                 catch (Exception error)
                 {
-                    UsageSnapshot localOnly = new UsageSnapshot();
-                    LocalTokenReader.Populate(localOnly);
                     BeginInvoke((MethodInvoker)delegate
                     {
                         isLive = false;
                         lastError = error.Message;
                         snapshot.ResetLabel = "DATA UNAVAILABLE";
-                        snapshot.ContextTokens = localOnly.ContextTokens;
-                        snapshot.ContextWindow = localOnly.ContextWindow;
                         Interlocked.Exchange(ref queryRunning, 0);
                         UpdateTrayIcon();
                         Invalidate();
                     });
+                }
+            });
+        }
+
+        private void QueueAllRefreshes()
+        {
+            QueueRefresh();
+            QueueContextRefresh();
+        }
+
+        private void QueueContextRefresh()
+        {
+            if (Interlocked.CompareExchange(ref contextQueryRunning, 1, 0) != 0) return;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                ContextUsage context;
+                bool success = LocalTokenReader.TryRead(out context);
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (success && context != null)
+                        {
+                            snapshot.ContextTokens = context.Tokens;
+                            snapshot.ContextWindow = context.Window;
+                            Invalidate();
+                        }
+                        Interlocked.Exchange(ref contextQueryRunning, 0);
+                    });
+                }
+                catch
+                {
+                    Interlocked.Exchange(ref contextQueryRunning, 0);
                 }
             });
         }
@@ -913,7 +1166,7 @@ namespace CodexEcamMonitor
         private void OnKeyDown(object sender, KeyEventArgs e)
         {
             if (e.KeyCode == Keys.Escape) Close();
-            else if (e.KeyCode == Keys.F5) QueueRefresh();
+            else if (e.KeyCode == Keys.F5) QueueAllRefreshes();
         }
 
         private void SetDefaultPosition()
@@ -941,6 +1194,7 @@ namespace CodexEcamMonitor
         private void OnClosing(object sender, FormClosingEventArgs e)
         {
             refreshTimer.Stop();
+            contextRefreshTimer.Stop();
             try { File.WriteAllText(positionFile, Left.ToString(CultureInfo.InvariantCulture) + "," + Top.ToString(CultureInfo.InvariantCulture)); }
             catch { }
             if (notifyIcon != null) notifyIcon.Visible = false;
@@ -952,6 +1206,7 @@ namespace CodexEcamMonitor
             if (disposing)
             {
                 if (refreshTimer != null) refreshTimer.Dispose();
+                if (contextRefreshTimer != null) contextRefreshTimer.Dispose();
                 if (titleFont != null) titleFont.Dispose();
                 if (scaleFont != null) scaleFont.Dispose();
                 if (valueFont != null) valueFont.Dispose();

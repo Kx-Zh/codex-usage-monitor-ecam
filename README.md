@@ -3,9 +3,9 @@
 [简体中文](README.zh-CN.md)
 
 A compact, always-on-top Windows monitor for Codex usage, reset credits, and
-the active local task's context load. Its main dial is inspired by the visual
-language of the Airbus A320 ECAM, while the lower-right context arc borrows the
-quantity-display idea of the Boeing 737 EICAS.
+the currently focused Codex Desktop task's context load. Its main dial is
+inspired by the visual language of the Airbus A320 ECAM, while the lower-right
+context arc borrows the quantity-display idea of the Boeing 737 EICAS.
 
 This is an independent community project, not an official OpenAI or aircraft
 manufacturer product.
@@ -23,7 +23,8 @@ main window is hidden:
 - ECAM-style green, amber, and red thresholds.
 - Current rate-limit window and reset time.
 - `RST` display for available full reset credits when reported by Codex.
-- `CTX K` gauge for the latest local task's context tokens in thousands.
+- `CTX K` gauge for the currently focused Codex Desktop task's context tokens
+  in thousands.
 - Borderless, draggable, always-on-top window with saved position.
 - Numeric Windows tray icon with show, hide, refresh, topmost, and exit actions.
 - The monitor itself is a native Windows executable with no WSL, Python, or
@@ -54,7 +55,7 @@ monitor.
 
 ## Quick start
 
-1. Download `CodexEcamMonitor-v1.0.0-win-x64.zip` from GitHub Releases.
+1. Download `CodexEcamMonitor-v1.0.1-win-x64.zip` from GitHub Releases.
 2. Verify the optional `.sha256` checksum and extract the ZIP to a normal
    writable directory.
 3. Install and authenticate Codex CLI as described above.
@@ -62,8 +63,10 @@ monitor.
 5. Drag the monitor to the desired display. Its position is restored on the
    next launch.
 
-The monitor refreshes once per minute. Press `F5` or choose **Refresh now**
-from the right-click menu for an immediate update.
+Account usage refreshes once per minute. The focused task and `CTX K` refresh
+independently every 5 seconds, so switching tasks in Codex Desktop is normally
+reflected within about 5 seconds. Press `F5` or choose **Refresh now** from the
+right-click menu to refresh both immediately.
 
 ## How Codex CLI is found
 
@@ -93,8 +96,10 @@ installation hint instead of crashing.
 - `WEEK`, `DAY`, `HR`, or `MIN` identifies the active window duration.
 - `RESET` is the next reset time in local time.
 - `RST` is the number of full reset credits reported by the account.
-- `CTX K` reads the most recently active local Codex task's context tokens;
-  the white 240-degree arc shows its share of that model's context window.
+- `CTX K` reads the currently focused Codex Desktop task's context tokens; the
+  white 240-degree arc shows its share of that model's context window. It uses
+  the last valid `token_count` event and divides
+  `info.last_token_usage.total_tokens` by `model_context_window`.
 
 `CTX K` is local task state, not an account token bill, and does not affect the
 main percentage.
@@ -116,10 +121,21 @@ installed Codex CLI and calls `account/rateLimits/read` through its local
 
 To avoid sharing Codex App database state, the monitor uses
 `%LOCALAPPDATA%\CodexEcamMonitor\codex-home` and copies available Codex login
-credential files from `%USERPROFILE%\.codex`. It also reads up to the final
-4 MB of the latest local session log from today or yesterday to obtain the
-`CTX K` value. Credentials and session logs are never included in builds or
-release packages.
+credential files from the user's Codex home. The source home is `CODEX_HOME`
+when set, otherwise `%USERPROFILE%\.codex`.
+
+For `CTX K`, the monitor follows the latest
+`thread_stream_view_activity_changed active=true` event in Codex Desktop logs,
+then recursively locates that conversation's JSONL under both `sessions` and
+`archived_sessions`. It supports logs from traditional installations under
+`%LOCALAPPDATA%\Codex\Logs` and `%LOCALAPPDATA%\OpenAI\Codex\Logs`, plus
+dynamically discovered Microsoft Store packages matching `OpenAI.Codex_*`. If
+the focused task cannot be identified, it falls back to the most recently
+written main-task session and excludes sessions marked as `subagent`.
+
+Temporary log or session read failures retain the last valid CTX value.
+Credentials, Codex CLI binaries, and user session data are never included in
+source tracking, builds, or release packages.
 
 ## Build from source
 
@@ -135,7 +151,7 @@ the application to `dist\CodexEcamMonitor.exe`.
 To build the complete release archive:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -Version 1.0.0
+powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -Version 1.0.1
 ```
 
 The ZIP and checksum are written to `release\`. The packaging script rejects
@@ -148,6 +164,10 @@ credentials, session logs, `codex.exe`, and files larger than 100 MB.
 - **NO DATA after an upgrade:** press `F5`; if the issue persists, confirm
   `codex app-server --stdio` starts with the installed CLI. This project uses
   an upstream app-server interface that may evolve.
+- **CTX does not follow the focused task:** confirm Codex Desktop has written
+  logs under a supported traditional or Microsoft Store location and that its
+  session exists under the resolved Codex home. Set `CODEX_HOME` if your Codex
+  data is stored elsewhere.
 - **Tray icon is missing:** open the Windows hidden-icons overflow.
 - **Font looks different:** keep `assets\ECAMFontRegular.ttf` beside the EXE.
 
